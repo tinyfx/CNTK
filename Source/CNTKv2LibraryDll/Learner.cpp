@@ -243,6 +243,16 @@ namespace CNTK
 
     /*virtual*/ bool LearnerBase::Update(unordered_map<Parameter, NDArrayViewPtr>& gradientValues, size_t trainingSampleCount, bool sweepEnd) /*override*/
     {
+        static pair<double,bool> previousLearningRateValue = make_pair(0, false); 
+        double currentLearningRateValue = GetCurrentTrainingParameterValue(m_learningRateSchedule);
+        if (!previousLearningRateValue.second ||
+            previousLearningRateValue.first != currentLearningRateValue)
+        {
+            previousLearningRateValue.second = true; // this indicates that the value was initialized.
+            previousLearningRateValue.first = currentLearningRateValue;
+            Log(GetTrainingParameterString(m_learningRateSchedule, L"Learning rate "));
+        }
+
         if (LearningRate(trainingSampleCount) == 0.0)
         {
             return false;
@@ -405,6 +415,25 @@ namespace CNTK
         }
     }
 
+    template <typename ElementType>
+    wstring LearnerBase::GetTrainingParameterString(const TrainingParameterSchedule<ElementType>& schedule, const wstring& prefix) const
+    {
+        wstringstream stream;
+        stream << prefix;
+        if (schedule.Unit() == TrainingParameterSchedule<ElementType>::UnitType::Minibatch)
+            stream << L"per minibatch = ";
+        else
+            stream << L"per sample = ";
+        stream << GetCurrentTrainingParameterValue(schedule);
+        return stream.str();
+    }
+
+    void LearnerBase::Log(const std::wstring& message) const
+    {
+        for (auto& writer : m_progressWriters)
+            writer->Log(message);
+    }
+
     LearnerSGD::LearnerSGD(const std::vector<Parameter>& parameters, 
                            const LearningRateSchedule& learningRateSchedule, 
                            AdditionalLearningOptions additionalOptions,
@@ -453,6 +482,16 @@ namespace CNTK
     /*virtual*/ void LearnerMomentumSGD::Update(const Parameter& parameter, const NDArrayViewPtr& gradientValue, 
                                                 const NDArrayViewPtr& smoothedGradientValue, size_t trainingSampleCount) const /*override*/
     {
+        static pair<double, bool> previousMomentumValue = make_pair(0, false);
+        double currentMomentumValue = GetCurrentTrainingParameterValue(m_momentumSchedule);
+        if (!previousMomentumValue.second ||
+            previousMomentumValue.first != currentMomentumValue)
+        {
+            previousMomentumValue.second = true; // this indicates that the value was initialized.
+            previousMomentumValue.first = currentMomentumValue;
+            Log(GetTrainingParameterString(m_momentumSchedule, L"Momentum "));
+        }
+
         DISPATCH_TO_TYPED_UPDATE_FUNCTION;
     }
 

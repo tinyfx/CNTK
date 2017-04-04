@@ -54,6 +54,11 @@ namespace CNTK
             return learningRate;
         }
 
+        template <typename ElementType>
+        std::wstring GetTrainingParameterString(const TrainingParameterSchedule<ElementType>& schedule, const std::wstring& prefix) const;
+
+        void Log(const std::wstring& message) const;
+
         AdditionalLearningOptions m_additionalOptions;
 
         std::unordered_map<Parameter, NDArrayViewPtr> m_smoothedGradientValues;
