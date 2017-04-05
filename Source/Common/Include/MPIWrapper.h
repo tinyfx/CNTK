@@ -97,7 +97,7 @@ public:
     virtual bool IsMultiHost() const = 0;
 
     // Use GPUDirect RDMA support
-    virtual int UseGpuGdr() = 0;
+    virtual bool UseGpuGdr() = 0;
 
     // -----------------------------------------------------------------------
     // data-exchange functions (wrappers around MPI functions)

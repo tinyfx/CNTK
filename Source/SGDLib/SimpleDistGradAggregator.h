@@ -138,6 +138,19 @@ private:
                                          });
     }
 
+    bool CopyDataToCPU(int deviceId)
+    {
+        // Donot copy if data is on CPU
+        if (deviceId == CPUDEVICE)
+            return false;
+
+        // Donot copy if NCCL is supported or GPUDirect RDMA is used
+        if (m_nccl.IsSupported() || m_mpi->UseGpuGdr() == true)
+            return false;
+
+        return true;
+    }
+
     void ResetState(const std::vector<Matrix<ElemType>*>& gradients, int numEvalNodes, bool resetState)
     {
         // When called the first time let's setup the intermediateCPU buffers for gradient aggregation if needed
@@ -146,8 +159,8 @@ private:
             m_initialized = true;
             int deviceId = gradients[0]->GetDeviceId();
 
-            // Initial data copy from GPU to CPU, if data on GPU and (GPUDirect RDMA not enabled or NCCL not supported)
-            if ((!m_nccl.IsSupported() || (m_mpi->UseGpuGdr() == 0)) && (deviceId != CPUDEVICE))
+            // Initial data copy from GPU to CPU
+            if (CopyDataToCPU(deviceId))
             {
                 m_allocator.reset(new CUDAPageLockedMemAllocator(deviceId));
             }
@@ -197,8 +210,7 @@ private:
                 m_gradientIndexToAggregate.insert(m_gradientIndexToAggregate.begin(), 1, (size_t)-1);
             }
 
-            // If running on GPU and (NCCL not supported or GPUDirect RDMA not enabled), initialize GPU and CPU data transfer
-            if ((!m_nccl.IsSupported() || (m_mpi->UseGpuGdr() == 0)) && (deviceId != CPUDEVICE))
+            if (CopyDataToCPU(deviceId))
             {
                 for (size_t i : m_gradientIndexToAggregate)
                 {
@@ -277,7 +289,7 @@ private:
         }
 
         // Initiate transfer of the bufferred data to the CPU if needed
-        if ((!m_nccl.IsSupported() || (m_mpi->UseGpuGdr() == 0)) && deviceId != CPUDEVICE)
+        if (CopyDataToCPU(deviceId))
         {
             size_t gpuDataTransfersIdx = 0;
             Matrix<ElemType>* gpuCopyBuffer = m_aggregationBuffer.get();

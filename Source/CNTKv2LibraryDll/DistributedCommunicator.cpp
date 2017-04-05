@@ -7,7 +7,6 @@
 #include <functional>
 #include "Basics.h"
 #include "Constants.h"
-#include "MPIWrapper.h"
 #include "CNTKLibrary.h"
 #include "DistributedCommunicator.h"
 #include "CUDAPageLockedMemAllocator.h"
@@ -329,13 +328,13 @@ namespace CNTK
 
         // Do the packing to reduce the number of MPI requests.
         // Donot re-allocating the continous buffer is existing buffer size equals to required one.
-        m_aggregationBufferFloat = setContinousBuffer<float>(packedFloatGradientsIndex, packedFloatGradientsSizeInBytes, inputValues, outputValues,
+        m_aggregationBufferFloat = SetContinousBuffer<float>(packedFloatGradientsIndex, packedFloatGradientsSizeInBytes, inputValues, outputValues,
             valuesToAggregate, valuesAfterAggregate);
-        m_aggregationBufferDouble = setContinousBuffer<double>(packedDoubleGradientsIndex, packedDoubleGradientsSizeInBytes, inputValues, outputValues,
+        m_aggregationBufferDouble = SetContinousBuffer<double>(packedDoubleGradientsIndex, packedDoubleGradientsSizeInBytes, inputValues, outputValues,
             valuesToAggregate, valuesAfterAggregate);
 
-        packToContinousBuffer(m_aggregationBufferFloat.get(), packedFloatGradientsIndex, inputValues, outputValues, valuesToAggregate, valuesAfterAggregate);
-        packToContinousBuffer(m_aggregationBufferDouble.get(), packedDoubleGradientsIndex, inputValues, outputValues, valuesToAggregate, valuesAfterAggregate);
+        PackToContinousBuffer(m_aggregationBufferFloat.get(), packedFloatGradientsIndex, inputValues, outputValues, valuesToAggregate, valuesAfterAggregate);
+        PackToContinousBuffer(m_aggregationBufferDouble.get(), packedDoubleGradientsIndex, inputValues, outputValues, valuesToAggregate, valuesAfterAggregate);
 
         numValues = valuesToAggregate.size();
 
@@ -354,31 +353,24 @@ namespace CNTK
             mainStreamSyncEvent->SynchronizeDataTransferFetchStreamWithEvent<float>();
         }
 
-        // For all values residing on GPU initiate async transfer to CPU buffers, if GPUDirect RDMA not supported
-        if (m_mpi->UseGpuGdr() == 0)
-        {
-            for (auto i = 0; i < numValues; ++i)
-            {
-                auto view = valuesToAggregate[i];
-                if (view->Device() != DeviceDescriptor::CPUDevice())
-                {
-                    auto& transferer = m_gpuDataTransferers[i];
-                    auto& buffer = m_intermediateCPUBuffers[i];
-                    transferer->CopyGPUToCPUAsync(GetDataBuffer(view), GetBufferSize(view), buffer.data.get());
-                }
-            }
-        }
+        // For all values residing on GPU initiate async transfer to CPU buffers if needed
+        CopyDataFromGPUToCPU(valuesToAggregate);
 
-        std::vector<MPI_Request> allReduceRequests(numValues);
+        std::vector<MPI_Request> allReduceRequests;
+        std::vector<size_t> gradientCopiedBetweenDevices;
         for (auto i = 0; i < numValues; ++i)
         {
             auto inputValue = valuesToAggregate[i];
 
-            if ((m_mpi->UseGpuGdr() == 0) && inputValue->Device() != DeviceDescriptor::CPUDevice())
+            if (ShouldCopyDataToCPU(inputValue->Device()))
             {
                 // TODO: actually, we can start reducing all cpu values first, and then wait for the gpu->cpu transfer to finish.
                 m_gpuDataTransferers[i]->WaitForCopyGPUToCPUAsync();
             }
+
+            // TODO: Remove when GPUDirect RDMA supports asynchronize collection
+            if (!m_mpi->UseGpuGdr())
+                gradientCopiedBetweenDevices.push_back(i);
 
             auto numElements = inputValue->Shape().TotalSize();
             auto dataType = inputValue->GetDataType();
@@ -389,63 +381,60 @@ namespace CNTK
             assert(dataType == outputValue->GetDataType());
             assert(inputValue->Device() == outputValue->Device());
 
-            void* inputData = ((m_mpi->UseGpuGdr() == 0) && inputValue->Device() != DeviceDescriptor::CPUDevice()) ?
-                m_intermediateCPUBuffers[i].data.get() : GetDataBuffer(inputValue);
-            void* outputData = ((m_mpi->UseGpuGdr() == 0) && inputValue->Device() != DeviceDescriptor::CPUDevice()) ?
-                m_intermediateCPUBuffers[i].data.get() : GetDataBuffer(outputValue);
+            void* inputData = (ShouldCopyDataToCPU(inputValue->Device())) ? m_intermediateCPUBuffers[i].data.get() : GetDataBuffer(inputValue);
+            void* outputData = (ShouldCopyDataToCPU(inputValue->Device())) ? m_intermediateCPUBuffers[i].data.get() : GetDataBuffer(outputValue);
 
             if (dataType == DataType::Float)
             {
-                allReduce(static_cast<float*>(inputData), static_cast<float*>(outputData), numElements, &allReduceRequests[i]);
+                AllReduceGradients(static_cast<float*>(inputData), static_cast<float*>(outputData), numElements, allReduceRequests);
             }
             else if (dataType == DataType::Double)
             {
-                allReduce(static_cast<double*>(inputData), static_cast<double*>(outputData), numElements, &allReduceRequests[i]);
+                AllReduceGradients(static_cast<double*>(inputData), static_cast<double*>(outputData), numElements, allReduceRequests);
             }
             else
                 LogicError("MPICommunicator: Unknown DataType.");
         }
 
-        // TODO: Do asynchronize collection when it is supported in GPUDirect RDMA
-        if (m_mpi->UseGpuGdr() == 0)
+        // wait for async all reduce to complete. As soon as one of the requests is finished,
+        // check if corresponding value is gpu bound and, if it is the case, initiate a cpu-to-gpu transfer.
+        size_t numAllReduceRequestsCompleted = 0;
+        assert(allReduceRequests.size() == gradientCopiedBetweenDevices.size());
+        while (numAllReduceRequestsCompleted < allReduceRequests.size())
         {
-            // wait for async all reduce to complete. As soon as one of the requests is finished,
-            // check if corresponding value is gpu bound and, if it is the case, initiate a cpu-to-gpu transfer.
-            size_t numAllReduceRequestsCompleted = 0;
-            while (numAllReduceRequestsCompleted < numValues)
+            int idx = MPI_UNDEFINED;
+            m_mpi->WaitAny(allReduceRequests.data(), (int)allReduceRequests.size(), &idx);
+            if (idx == MPI_UNDEFINED)
             {
-                int idx = MPI_UNDEFINED;
-                m_mpi->WaitAny(allReduceRequests.data(), (int)allReduceRequests.size(), &idx);
-                if (idx == MPI_UNDEFINED)
-                {
-                    break;
-                }
-
-                numAllReduceRequestsCompleted++;
-
-                assert(idx < valuesToAggregate.size());
-                auto value = valuesToAggregate[idx];
-
-                if (value->Device() != DeviceDescriptor::CPUDevice())
-                {
-                    auto view = valuesAfterAggregate[idx];
-                    auto size = GetBufferSize(view);
-                    auto& transferer = m_gpuDataTransferers[idx];
-                    auto& buffer = m_intermediateCPUBuffers[idx];
-                    transferer->CopyCPUToGPUAsync(buffer.data.get(), size, GetDataBuffer(view));
-                }
+                break;
             }
-            // TODO: Should not wait, simply publishing event on the compute stream should be sufficient
-            for (auto i = 0; i < numValues; ++i)
+
+            numAllReduceRequestsCompleted++;
+
+            assert(idx < valuesToAggregate.size());
+            assert(idx < gradientCopiedBetweenDevices.size());
+            idx = gradientCopiedBetweenDevices[idx]; // Get the gradient index in VaulesToAggregate
+            auto value = valuesToAggregate[idx];
+
+            if (ShouldCopyDataToCPU(value->Device()))
             {
-                if (valuesToAggregate[i]->Device() != DeviceDescriptor::CPUDevice())
-                    m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+                auto view = valuesAfterAggregate[idx];
+                auto size = GetBufferSize(view);
+                auto& transferer = m_gpuDataTransferers[idx];
+                auto& buffer = m_intermediateCPUBuffers[idx];
+                transferer->CopyCPUToGPUAsync(buffer.data.get(), size, GetDataBuffer(view));
             }
+        }
+        // TODO: Should not wait, simply publishing event on the compute stream should be sufficient
+        for (auto i = 0; i < numValues; ++i)
+        {
+            if (ShouldCopyDataToCPU(valuesToAggregate[i]->Device()))
+                m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
         }
 
         // Unpack the continuous buffer
-        unpackFromContinousBuffer(m_aggregationBufferFloat.get(), outputValues, packedFloatGradientsIndex);
-        unpackFromContinousBuffer(m_aggregationBufferDouble.get(), outputValues, packedDoubleGradientsIndex);
+        UnpackFromContinousBuffer(m_aggregationBufferFloat.get(), outputValues, packedFloatGradientsIndex);
+        UnpackFromContinousBuffer(m_aggregationBufferDouble.get(), outputValues, packedDoubleGradientsIndex);
     }
 
     void  MPICommunicatorImpl::Barrier()
@@ -453,8 +442,34 @@ namespace CNTK
         m_mpi->WaitAll();
     }
 
+    bool MPICommunicatorImpl::ShouldCopyDataToCPU(DeviceDescriptor deviceType)
+    {
+        if (deviceType == DeviceDescriptor::CPUDevice())
+            return false;
+
+        // Donot copy if NCCL is supported or GPUDirect RDMA is used
+        if (m_mpi->UseGpuGdr())
+            return false;
+
+        return true;
+    }
+
+    void MPICommunicatorImpl::CopyDataFromGPUToCPU(std::vector<NDArrayViewPtr>& inputValues)
+    {
+        for (auto i = 0; i < inputValues.size(); ++i)
+        {
+            auto view = inputValues[i];
+            if (ShouldCopyDataToCPU(inputValues[i]->Device()))
+            {
+                auto& transferer = m_gpuDataTransferers[i];
+                auto& buffer = m_intermediateCPUBuffers[i];
+                transferer->CopyGPUToCPUAsync(GetDataBuffer(view), GetBufferSize(view), buffer.data.get());
+            }
+        }
+    }
+
     template <typename ElemType>
-    std::unique_ptr<Matrix<ElemType>> MPICommunicatorImpl::setContinousBuffer(std::vector<size_t>& packedGradientsIndex, size_t packedGradientsSizeInBytes,
+    std::unique_ptr<Matrix<ElemType>> MPICommunicatorImpl::SetContinousBuffer(std::vector<size_t>& packedGradientsIndex, size_t packedGradientsSizeInBytes,
         const std::vector<NDArrayViewPtr>& inputValues, const std::vector<NDArrayViewPtr>& outputValues,
         std::vector<NDArrayViewPtr>& valuesToAggregate, std::vector<NDArrayViewPtr>& valuesAfterAggregate)
     {
@@ -473,7 +488,7 @@ namespace CNTK
     }
 
     template <typename ElemType>
-    void MPICommunicatorImpl::packToContinousBuffer(Matrix<ElemType>* aggregationBuffer, std::vector<size_t>& packedGradientsIndex,
+    void MPICommunicatorImpl::PackToContinousBuffer(Matrix<ElemType>* aggregationBuffer, std::vector<size_t>& packedGradientsIndex,
         const std::vector<NDArrayViewPtr>& inputValues, const std::vector<NDArrayViewPtr>& outputValues, std::vector<NDArrayViewPtr>& valuesToAggregate, std::vector<NDArrayViewPtr>& valuesAfterAggregate)
     {
         if (packedGradientsIndex.size() < 1)
@@ -507,7 +522,7 @@ namespace CNTK
     }
 
     template <typename ElemType>
-    void MPICommunicatorImpl::unpackFromContinousBuffer(Matrix<ElemType>* aggregationBuffer, const std::vector<NDArrayViewPtr>& outputValues,
+    void MPICommunicatorImpl::UnpackFromContinousBuffer(Matrix<ElemType>* aggregationBuffer, const std::vector<NDArrayViewPtr>& outputValues,
         std::vector<size_t>& packedGradientsIndex)
     {
         if (packedGradientsIndex.size() != 0)
@@ -523,14 +538,15 @@ namespace CNTK
     }
 
     template <typename ElemType>
-    void MPICommunicatorImpl::allReduce(ElemType* inputData, ElemType* outputData, size_t numElements, MPI_Request* allReduceRequest)
+    void MPICommunicatorImpl::AllReduceGradients(ElemType* inputData, ElemType* outputData, size_t numElements, std::vector<MPI_Request> &allReduceRequests)
     {
-        if (m_mpi->UseGpuGdr() == 0)
+        if (!m_mpi->UseGpuGdr())
         {
+            allReduceRequests.push_back(MPI_Request());
             if (inputData == outputData)
-                m_mpi->AllReduceAsync(outputData, numElements, allReduceRequest);
+                m_mpi->AllReduceAsync(outputData, numElements, &allReduceRequests.back());
             else
-                m_mpi->AllReduceAsync(inputData, outputData, numElements, allReduceRequest);
+                m_mpi->AllReduceAsync(inputData, outputData, numElements, &allReduceRequests.back());
         }
         // TODO: Change to asynchronize collection when it is supported by GPUDirect RDMA
         else
