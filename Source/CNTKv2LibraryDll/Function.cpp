@@ -1583,6 +1583,20 @@ namespace CNTK
         return UnaryOp(PrimitiveOpType::StopGradient, operand, Dictionary(), name);
     }
 
+    FunctionPtr ToSequence(const Variable& operand, const std::wstring& sequenceAxisNamePrefix, const std::wstring& name)
+    {
+        Dictionary additionalAttributes;
+        additionalAttributes[PrimitiveFunction::AttributeNameSequenceAxisNamePrefix] = sequenceAxisNamePrefix;
+        return UnaryOp(PrimitiveOpType::ToSequence, operand, std::move(additionalAttributes), name);
+    }
+
+    FunctionPtr ToSequence(const Variable& operand, const Variable& sequenceLengths, const std::wstring& sequenceAxisNamePrefix, const std::wstring& name)
+    {
+        Dictionary additionalAttributes;
+        additionalAttributes[PrimitiveFunction::AttributeNameSequenceAxisNamePrefix] = sequenceAxisNamePrefix;
+        return BinaryOp(PrimitiveOpType::ToSequence, operand, sequenceLengths, std::move(additionalAttributes), name);
+    }
+
     namespace Sequence
     {
         void VerifyIsSequence(const Variable& operand)

@@ -2379,6 +2379,41 @@ def argmin(x, axis=None, name=''):
     axis = sanitize_axis(axis)
     return argmin(x, axis, name)
 
+@typemap
+def to_sequence(x, sequence_lengths=None, sequence_axis_name_prefix='toSequence_', name=''):
+    '''
+    This function converts 'x' to a sequence using the most significant
+    static axis [0] as the sequence axis.
+
+    The sequenceLengths input is optional; if unspecified, all sequences are
+    assumed to be of the same length; i.e. dimensionality of the most significant
+    static axis
+
+    Example:
+        TBA.
+
+    Args:
+        x: the tensor (or its name) which is converted to a sequence
+        sequence_lengths: Optional tensor operand representing the sequence lengths.
+            if unspecified, all sequences are assumed to be of the same length; 
+            i.e. dimensionality of the most significant static axis.
+        sequence_axis_name_prefix (str, optional): prefix of the new sequence axis name.
+        name (str, optional): the name of the Function instance in the network
+
+    Returns:
+        :class:`~cntk.ops.functions.Function`
+    '''
+
+    from cntk.cntk_py import to_sequence
+
+    x = sanitize_input(x)
+    if sequence_lengths is None:
+        return to_sequence(x, sequence_axis_name_prefix, name)
+    else:
+        sequence_lengths = sanitize_input(sequence_lengths)
+        return to_sequence(x, sequence_lengths, sequence_axis_name_prefix, name)
+
+
 #######################################################################
 # training ops
 #######################################################################
